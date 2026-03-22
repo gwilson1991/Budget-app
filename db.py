@@ -7,6 +7,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 import streamlit as st
 from datetime import datetime
+import pandas as pd
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -48,7 +49,6 @@ DEFAULT_CATEGORIES = {
     "Opulence": ["Electronics", "Gunn", "Abi", "Entertainment"],
 }
 
-# Default group ordering
 DEFAULT_GROUP_ORDER = [
     "Fixed Bills", "Monthly Variables", "Subscriptions", "Long Term",
     "Yearly Expenses", "For Others", "Comfort", "Opulence",
@@ -58,7 +58,6 @@ DEFAULT_GROUP_ORDER = [
 def get_spreadsheet():
     """Get authenticated connection to the budget spreadsheet."""
     creds_info = dict(st.secrets["gcp_service_account"])
-    # gspread expects the private_key newlines to be actual newlines
     if "private_key" in creds_info:
         creds_info["private_key"] = creds_info["private_key"].replace("\\n", "\n")
     creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
@@ -67,30 +66,23 @@ def get_spreadsheet():
 
 
 def initialize_sheets(spreadsheet):
-    """
-    Create all required tabs with headers if they don't exist.
-    Populate default categories on first run.
-    """
+    """Create all required tabs with headers if they don't exist."""
     existing_tabs = [ws.title for ws in spreadsheet.worksheets()]
 
-    # --- Categories tab ---
     if TAB_CATEGORIES not in existing_tabs:
         ws = spreadsheet.add_worksheet(title=TAB_CATEGORIES, rows=100, cols=4)
         ws.update("A1:D1", [["group_name", "category_name", "group_order", "category_order"]])
-        # Populate default categories
         rows = []
         for g_idx, group in enumerate(DEFAULT_GROUP_ORDER):
             for c_idx, cat in enumerate(DEFAULT_CATEGORIES[group]):
                 rows.append([group, cat, g_idx, c_idx])
         if rows:
             ws.update(f"A2:D{len(rows) + 1}", rows)
-    
-    # --- Budget tab ---
+
     if TAB_BUDGET not in existing_tabs:
         ws = spreadsheet.add_worksheet(title=TAB_BUDGET, rows=1000, cols=3)
         ws.update("A1:C1", [["month", "category_name", "budgeted"]])
 
-    # --- Transactions tab ---
     if TAB_TRANSACTIONS not in existing_tabs:
         ws = spreadsheet.add_worksheet(title=TAB_TRANSACTIONS, rows=5000, cols=9)
         ws.update("A1:I1", [[
@@ -98,17 +90,14 @@ def initialize_sheets(spreadsheet):
             "category", "type", "month", "upload_id", "bank_hint",
         ]])
 
-    # --- Vendor Map tab ---
     if TAB_VENDOR_MAP not in existing_tabs:
         ws = spreadsheet.add_worksheet(title=TAB_VENDOR_MAP, rows=500, cols=2)
         ws.update("A1:B1", [["vendor_clean", "category"]])
 
-    # --- Settings tab ---
     if TAB_SETTINGS not in existing_tabs:
         ws = spreadsheet.add_worksheet(title=TAB_SETTINGS, rows=20, cols=2)
         ws.update("A1:B1", [["key", "value"]])
 
-    # Remove the default "Sheet1" if our tabs were just created
     if "Sheet1" in existing_tabs and len(spreadsheet.worksheets()) > 1:
         try:
             spreadsheet.del_worksheet(spreadsheet.worksheet("Sheet1"))
@@ -119,16 +108,12 @@ def initialize_sheets(spreadsheet):
 # ─── CATEGORIES ────────────────────────────────────────────────────────────
 
 def get_categories(spreadsheet):
-    """
-    Returns an ordered dict: {group_name: [category_names]}
-    Sorted by group_order, then category_order.
-    """
+    """Returns an ordered dict: {group_name: [category_names]}"""
     ws = spreadsheet.worksheet(TAB_CATEGORIES)
     records = ws.get_all_records()
     if not records:
         return {}
 
-    # Sort by group_order then category_order
     records.sort(key=lambda r: (int(r.get("group_order", 0)), int(r.get("category_order", 0))))
 
     from collections import OrderedDict
@@ -149,93 +134,70 @@ def get_all_category_names(spreadsheet):
 
 
 def add_category(spreadsheet, group_name, category_name):
-    """Add a new category to an existing group."""
     ws = spreadsheet.worksheet(TAB_CATEGORIES)
     records = ws.get_all_records()
-
-    # Find the max category_order in this group
     max_order = -1
     group_order = 0
     for r in records:
         if r["group_name"] == group_name:
             group_order = int(r.get("group_order", 0))
             max_order = max(max_order, int(r.get("category_order", 0)))
-
-    new_row = [group_name, category_name, group_order, max_order + 1]
-    ws.append_row(new_row, value_input_option="USER_ENTERED")
+    ws.append_row([group_name, category_name, group_order, max_order + 1],
+                  value_input_option="USER_ENTERED")
 
 
 def delete_category(spreadsheet, group_name, category_name):
-    """Delete a category. Also cleans up budget entries for it."""
     ws = spreadsheet.worksheet(TAB_CATEGORIES)
     records = ws.get_all_records()
-
-    # Find and delete the row (records are 0-indexed, sheet rows are 1-indexed + header)
     for i, r in enumerate(records):
         if r["group_name"] == group_name and r["category_name"] == category_name:
-            ws.delete_rows(i + 2)  # +2 for header row and 1-indexing
+            ws.delete_rows(i + 2)
             break
 
 
 def rename_category(spreadsheet, group_name, old_name, new_name):
-    """Rename a category. Also updates budget and transaction references."""
     ws = spreadsheet.worksheet(TAB_CATEGORIES)
     records = ws.get_all_records()
-
     for i, r in enumerate(records):
         if r["group_name"] == group_name and r["category_name"] == old_name:
-            ws.update_cell(i + 2, 2, new_name)  # Column B = category_name
+            ws.update_cell(i + 2, 2, new_name)
             break
-
-    # Update budget tab references
     _rename_in_tab(spreadsheet, TAB_BUDGET, "category_name", old_name, new_name)
-    # Update transaction tab references
     _rename_in_tab(spreadsheet, TAB_TRANSACTIONS, "category", old_name, new_name)
 
 
 def add_group(spreadsheet, group_name):
-    """Add a new empty group (it will appear once a category is added to it)."""
     ws = spreadsheet.worksheet(TAB_CATEGORIES)
     records = ws.get_all_records()
     max_group_order = max((int(r.get("group_order", 0)) for r in records), default=-1)
-    # We need at least one category to show the group; add a placeholder note
-    # Actually, just return the next group order - caller should add a category right after
     return max_group_order + 1
 
 
 def delete_group(spreadsheet, group_name):
-    """Delete an entire group and all its categories."""
     ws = spreadsheet.worksheet(TAB_CATEGORIES)
     records = ws.get_all_records()
-
-    # Find rows to delete (go in reverse to maintain indices)
     rows_to_delete = []
     for i, r in enumerate(records):
         if r["group_name"] == group_name:
             rows_to_delete.append(i + 2)
-
     for row_num in sorted(rows_to_delete, reverse=True):
         ws.delete_rows(row_num)
 
 
 def rename_group(spreadsheet, old_name, new_name):
-    """Rename a category group."""
     ws = spreadsheet.worksheet(TAB_CATEGORIES)
     records = ws.get_all_records()
-
     for i, r in enumerate(records):
         if r["group_name"] == old_name:
-            ws.update_cell(i + 2, 1, new_name)  # Column A = group_name
+            ws.update_cell(i + 2, 1, new_name)
 
 
 def _rename_in_tab(spreadsheet, tab_name, column_name, old_value, new_value):
-    """Helper to rename values in a specific column of a tab."""
     try:
         ws = spreadsheet.worksheet(tab_name)
         records = ws.get_all_records()
         headers = ws.row_values(1)
-        col_idx = headers.index(column_name) + 1  # 1-indexed
-
+        col_idx = headers.index(column_name) + 1
         for i, r in enumerate(records):
             if r.get(column_name) == old_value:
                 ws.update_cell(i + 2, col_idx, new_value)
@@ -246,14 +208,8 @@ def _rename_in_tab(spreadsheet, tab_name, column_name, old_value, new_value):
 # ─── BUDGET ────────────────────────────────────────────────────────────────
 
 def get_budget_for_month(spreadsheet, month_str):
-    """
-    Get budget allocations for a specific month.
-    Returns dict: {category_name: budgeted_amount}
-    month_str format: "YYYY-MM"
-    """
     ws = spreadsheet.worksheet(TAB_BUDGET)
     records = ws.get_all_records()
-
     budget = {}
     for r in records:
         if r["month"] == month_str:
@@ -262,14 +218,8 @@ def get_budget_for_month(spreadsheet, month_str):
 
 
 def get_all_budgets_through_month(spreadsheet, month_str):
-    """
-    Get cumulative budgeted amounts for all categories,
-    from the beginning of time through the given month.
-    Returns dict: {category_name: total_budgeted}
-    """
     ws = spreadsheet.worksheet(TAB_BUDGET)
     records = ws.get_all_records()
-
     totals = {}
     for r in records:
         if r["month"] <= month_str:
@@ -279,42 +229,77 @@ def get_all_budgets_through_month(spreadsheet, month_str):
 
 
 def set_budget(spreadsheet, month_str, category_name, amount):
-    """
-    Set the budgeted amount for a category in a specific month.
-    Creates the row if it doesn't exist, updates if it does.
-    """
     ws = spreadsheet.worksheet(TAB_BUDGET)
     records = ws.get_all_records()
-
-    # Check if row already exists
     for i, r in enumerate(records):
         if r["month"] == month_str and r["category_name"] == category_name:
-            ws.update_cell(i + 2, 3, amount)  # Column C = budgeted
+            ws.update_cell(i + 2, 3, amount)
             return
-
-    # Row doesn't exist, append it
-    ws.append_row(
-        [month_str, category_name, amount],
-        value_input_option="USER_ENTERED",
-    )
+    ws.append_row([month_str, category_name, amount], value_input_option="USER_ENTERED")
 
 
 def get_total_budgeted_through_month(spreadsheet, month_str):
-    """Get the total amount budgeted across ALL categories through a given month."""
     totals = get_all_budgets_through_month(spreadsheet, month_str)
     return sum(totals.values())
 
 
-# ─── TRANSACTIONS (Phase 2 prep, minimal for now) ─────────────────────────
+# ─── TRANSACTIONS ──────────────────────────────────────────────────────────
+
+def get_all_transactions(spreadsheet):
+    """Get all transactions as a list of dicts."""
+    ws = spreadsheet.worksheet(TAB_TRANSACTIONS)
+    return ws.get_all_records()
+
+
+def get_existing_transaction_keys(spreadsheet):
+    """
+    Get a set of dedup keys for all existing transactions.
+    Key: "date|amount|description|account"
+    """
+    records = get_all_transactions(spreadsheet)
+    keys = set()
+    for r in records:
+        key = f"{r.get('date', '')}|{r.get('amount', '')}|{r.get('description', '')}|{r.get('account', '')}"
+        keys.add(key)
+    return keys
+
+
+def save_transactions(spreadsheet, transactions_df):
+    """
+    Bulk save transactions to the Transactions tab.
+    Expects columns: date, description, amount, account, category, type, month, upload_id, bank_hint
+    """
+    if transactions_df.empty:
+        return
+
+    ws = spreadsheet.worksheet(TAB_TRANSACTIONS)
+    rows = []
+    for _, row in transactions_df.iterrows():
+        rows.append([
+            str(row.get("date", "")),
+            str(row.get("description", "")),
+            float(row.get("amount", 0)),
+            str(row.get("account", "")),
+            str(row.get("category", "")),
+            str(row.get("type", "")),
+            str(row.get("month", "")),
+            str(row.get("upload_id", "")),
+            str(row.get("bank_hint", "")),
+        ])
+
+    if rows:
+        ws.append_rows(rows, value_input_option="USER_ENTERED")
+
+
+def update_transaction_category(spreadsheet, row_index, new_category):
+    """Update the category of a specific transaction (0-based index)."""
+    ws = spreadsheet.worksheet(TAB_TRANSACTIONS)
+    ws.update_cell(row_index + 2, 5, new_category)
+
 
 def get_spending_through_month(spreadsheet, month_str):
-    """
-    Get cumulative spending per category through the given month.
-    Returns dict: {category_name: total_spent}
-    """
     ws = spreadsheet.worksheet(TAB_TRANSACTIONS)
     records = ws.get_all_records()
-
     totals = {}
     for r in records:
         if r.get("month", "") <= month_str and r.get("type") == "expense":
@@ -325,13 +310,8 @@ def get_spending_through_month(spreadsheet, month_str):
 
 
 def get_spending_for_month(spreadsheet, month_str):
-    """
-    Get spending per category for a specific month.
-    Returns dict: {category_name: spent_amount}
-    """
     ws = spreadsheet.worksheet(TAB_TRANSACTIONS)
     records = ws.get_all_records()
-
     totals = {}
     for r in records:
         if r.get("month", "") == month_str and r.get("type") == "expense":
@@ -342,10 +322,8 @@ def get_spending_for_month(spreadsheet, month_str):
 
 
 def get_total_income_through_month(spreadsheet, month_str):
-    """Get total income from all transactions through the given month."""
     ws = spreadsheet.worksheet(TAB_TRANSACTIONS)
     records = ws.get_all_records()
-
     total = 0
     for r in records:
         if r.get("month", "") <= month_str and r.get("type") == "income":
@@ -354,10 +332,8 @@ def get_total_income_through_month(spreadsheet, month_str):
 
 
 def get_income_for_month(spreadsheet, month_str):
-    """Get total income for a specific month."""
     ws = spreadsheet.worksheet(TAB_TRANSACTIONS)
     records = ws.get_all_records()
-
     total = 0
     for r in records:
         if r.get("month", "") == month_str and r.get("type") == "income":
@@ -365,10 +341,54 @@ def get_income_for_month(spreadsheet, month_str):
     return total
 
 
+# ─── VENDOR MAP ────────────────────────────────────────────────────────────
+
+def get_vendor_map(spreadsheet):
+    """Get vendor-to-category mapping as a dict."""
+    ws = spreadsheet.worksheet(TAB_VENDOR_MAP)
+    records = ws.get_all_records()
+    return {r["vendor_clean"]: r["category"] for r in records if r.get("vendor_clean")}
+
+
+def update_vendor_map(spreadsheet, vendor_clean, category):
+    """Add or update a single vendor mapping."""
+    if not vendor_clean or not category:
+        return
+    ws = spreadsheet.worksheet(TAB_VENDOR_MAP)
+    records = ws.get_all_records()
+    for i, r in enumerate(records):
+        if r.get("vendor_clean", "").upper() == vendor_clean.upper():
+            ws.update_cell(i + 2, 2, category)
+            return
+    ws.append_row([vendor_clean, category], value_input_option="USER_ENTERED")
+
+
+def bulk_update_vendor_map(spreadsheet, mappings):
+    """Update multiple vendor mappings. mappings: list of (vendor_clean, category) tuples."""
+    if not mappings:
+        return
+    ws = spreadsheet.worksheet(TAB_VENDOR_MAP)
+    records = ws.get_all_records()
+    existing = {r.get("vendor_clean", "").upper(): i for i, r in enumerate(records)}
+
+    new_rows = []
+    for vendor, category in mappings:
+        if not vendor or not category:
+            continue
+        if vendor.upper() in existing:
+            row_idx = existing[vendor.upper()]
+            ws.update_cell(row_idx + 2, 2, category)
+        else:
+            new_rows.append([vendor, category])
+            existing[vendor.upper()] = len(records) + len(new_rows)
+
+    if new_rows:
+        ws.append_rows(new_rows, value_input_option="USER_ENTERED")
+
+
 # ─── SETTINGS ──────────────────────────────────────────────────────────────
 
 def get_setting(spreadsheet, key, default=None):
-    """Get a setting value by key."""
     ws = spreadsheet.worksheet(TAB_SETTINGS)
     records = ws.get_all_records()
     for r in records:
@@ -378,13 +398,10 @@ def get_setting(spreadsheet, key, default=None):
 
 
 def set_setting(spreadsheet, key, value):
-    """Set a setting value. Creates it if it doesn't exist."""
     ws = spreadsheet.worksheet(TAB_SETTINGS)
     records = ws.get_all_records()
-
     for i, r in enumerate(records):
         if r["key"] == key:
-            ws.update_cell(i + 2, 2, value)  # Column B = value
+            ws.update_cell(i + 2, 2, value)
             return
-
     ws.append_row([key, value], value_input_option="USER_ENTERED")
