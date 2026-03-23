@@ -245,52 +245,47 @@ def parse_capitol_one(file):
     return pd.DataFrame(transactions)
 
 
-# ─── CHASE PARSER (placeholder — same structure expected) ────────────────
+# ─── CHASE PARSER ─────────────────────────────────────────────────────────
 
 def parse_chase(file):
     """
-    Parse Chase credit card CSV export.
-    This is a placeholder — the exact format will be configured once a sample
-    CSV is available. Chase CSVs typically have:
-    Transaction Date, Post Date, Description, Category, Type, Amount
+    Parse Chase credit card CSV export (Amazon Prime card).
+
+    Columns: Transaction Date, Post Date, Description, Category, Type, Amount, Memo
+    Date format: MM/DD/YYYY
+    Amount: negative = expense/sale, positive = payment/return
+    Type: "Sale" = expense, "Payment" = transfer, "Return" = negative expense (refund)
     """
     df = pd.read_csv(file)
     df.columns = df.columns.str.strip()
 
     transactions = []
-
-    # Try common Chase format
     for _, row in df.iterrows():
         description = str(row.get("Description", "")).strip()
+        chase_type = str(row.get("Type", "")).strip()
+        bank_category = str(row.get("Category", "")).strip()
 
-        # Chase often has a single "Amount" column (negative = expense)
-        if "Amount" in df.columns:
-            raw_amount = float(str(row.get("Amount", "0")).replace(",", ""))
-            amount = abs(raw_amount)
-            if raw_amount > 0:
-                txn_type = "transfer"  # Payments show as positive
-            else:
-                txn_type = "expense"
-        elif "Debit" in df.columns:
-            debit = row.get("Debit", "")
-            credit = row.get("Credit", "")
-            if pd.notna(debit) and str(debit).strip():
-                amount = abs(float(str(debit).replace(",", "")))
-            elif pd.notna(credit) and str(credit).strip():
-                amount = abs(float(str(credit).replace(",", "")))
-            else:
-                continue
-            txn_type = detect_type_creditcard(
-                debit if pd.notna(debit) else "",
-                credit if pd.notna(credit) else "",
-            )
-        else:
+        # Parse amount — Chase uses a single column (negative = expense)
+        raw_amount = row.get("Amount", 0)
+        if pd.isna(raw_amount) or str(raw_amount).strip() == "":
             continue
+        raw_amount = float(str(raw_amount).replace(",", ""))
+        amount = abs(raw_amount)
 
-        # Parse date
-        date_str = str(
-            row.get("Transaction Date", row.get("Trans Date", ""))
-        ).strip()
+        # Determine transaction type
+        if chase_type == "Payment":
+            txn_type = "transfer"
+        elif chase_type == "Return":
+            # Returns are negative expenses — they reduce spending in a category
+            # Store as negative amount with type "expense" so budget math works
+            txn_type = "expense"
+            amount = -abs(raw_amount)  # Negative expense = refund
+        else:
+            # Sale or anything else = expense
+            txn_type = "expense"
+
+        # Parse date (use Transaction Date, not Post Date)
+        date_str = str(row.get("Transaction Date", "")).strip()
         try:
             date_obj = datetime.strptime(date_str, "%m/%d/%Y")
         except ValueError:
@@ -298,8 +293,6 @@ def parse_chase(file):
                 date_obj = datetime.strptime(date_str, "%Y-%m-%d")
             except ValueError:
                 continue
-
-        bank_category = str(row.get("Category", "")).strip()
 
         transactions.append({
             "date": date_obj.strftime("%Y-%m-%d"),
