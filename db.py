@@ -305,7 +305,8 @@ def get_spending_through_month(spreadsheet, month_str):
         if r.get("month", "") <= month_str and r.get("type") == "expense":
             cat = r.get("category", "")
             if cat:
-                totals[cat] = totals.get(cat, 0) + abs(float(r.get("amount", 0)))
+                # No abs() — returns/refunds are stored as negative and reduce spending
+                totals[cat] = totals.get(cat, 0) + float(r.get("amount", 0))
     return totals
 
 
@@ -317,7 +318,8 @@ def get_spending_for_month(spreadsheet, month_str):
         if r.get("month", "") == month_str and r.get("type") == "expense":
             cat = r.get("category", "")
             if cat:
-                totals[cat] = totals.get(cat, 0) + abs(float(r.get("amount", 0)))
+                # No abs() — returns/refunds are stored as negative and reduce spending
+                totals[cat] = totals.get(cat, 0) + float(r.get("amount", 0))
     return totals
 
 
